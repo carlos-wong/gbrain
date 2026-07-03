@@ -817,6 +817,7 @@ export interface BrainEngine {
    */
   listPages(filters?: PageFilters): Promise<Page[]>;
   /**
+  listSlugsByRegex(pattern: string, opts?: { limit?: number; offset?: number; type?: string; sort_by?: "slug" | "title" | "updated_at"; sort_order?: "asc" | "desc" }): Promise<{ slug: string; title: string; type: string; updated_at: string; compiled_truth: string }[]>;
    * Fuzzy slug resolver.
    *
    * v0.41.13 (#1436): `opts.sourceId` scopes the search to a single source;

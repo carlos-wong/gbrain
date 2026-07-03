@@ -1227,6 +1227,29 @@ export class PostgresEngine implements BrainEngine {
     return rows.map(rowToPage);
   }
 
+  async listSlugsByRegex(
+    pattern: string,
+    opts?: { limit?: number; offset?: number; type?: string; sort_by?: "slug" | "title" | "updated_at"; sort_order?: "asc" | "desc" }
+  ): Promise<{ slug: string; title: string; type: string; updated_at: string; compiled_truth: string }[]> {
+    const sql = this.sql;
+    const limit = Math.min(opts?.limit ?? 50, 500);
+    const offset = opts?.offset ?? 0;
+    const typeCondition = opts?.type ? sql`AND p.type = ${opts.type}` : sql``;
+    const sortColumn = opts?.sort_by === "updated_at" ? "p.updated_at" : opts?.sort_by === "title" ? "p.title" : "p.slug";
+    const sortDirection = opts?.sort_order === "desc" ? "DESC" : "ASC";
+    const orderBy = sql.unsafe(`ORDER BY ${sortColumn} ${sortDirection}`);
+    const rows = await sql`
+      SELECT p.slug, p.title, p.type, p.updated_at, p.compiled_truth
+      FROM pages p
+      WHERE p.slug ~ ${pattern}
+      AND p.deleted_at IS NULL
+      ${typeCondition}
+      ${orderBy}
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    return rows as unknown as { slug: string; title: string; type: string; updated_at: string; compiled_truth: string }[];
+  }
+
   async getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>> {
     const sql = this.sql;
     // v0.31.8 (D12): two-branch. See pglite-engine.ts:getAllSlugs for context.

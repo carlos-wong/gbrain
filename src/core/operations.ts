@@ -5313,6 +5313,7 @@ const chronicle_backfill: Operation = {
   cliHints: { name: 'chronicle-backfill' },
 };
 
+const list_slugs: Operation = {   name: 'list_slugs',   description: 'List page slugs matching a POSIX regex pattern. Returns slug, title, type, updated_at, and text (compiled_truth). Preprocesses \d to [0-9], \w to [a-zA-Z0-9_], \s to [[:space:]] for convenience.',   params: {     pattern: { type: 'string', required: true, description: 'Regex pattern (\d, \w, \s auto-expanded to POSIX classes)' },     limit: { type: 'number', description: 'Max results (default 50, cap 500)' },     offset: { type: 'number', description: 'Pagination offset (default 0)' },     type: { type: 'string', description: 'Optional type filter (e.g. journal, debrief)' },     sort_by: { type: 'string', enum: ['slug', 'title', 'updated_at'], description: 'Sort field (default slug)' },     sort_order: { type: 'string', enum: ['asc', 'desc'], description: 'Sort direction (default asc)' },   },   scope: 'read',   handler: async (ctx, p) => {     let pattern = String(p.pattern);     pattern = pattern.replace(/\\d/g, '[0-9]').replace(/\\w/g, '[a-zA-Z0-9_]').replace(/\\s/g, '[[:space:]]');     const results = await ctx.engine.listSlugsByRegex(pattern, {       limit: p.limit as number | undefined,       offset: p.offset as number | undefined,       type: p.type as string | undefined,       sort_by: p.sort_by as 'slug' | 'title' | 'updated_at' | undefined,       sort_order: p.sort_order as 'asc' | 'desc' | undefined,     });     return results.map(r => ({ slug: r.slug, title: r.title, type: r.type, updated_at: r.updated_at, text: r.compiled_truth || '' }));   },   cliHints: { name: 'list-slugs', positional: ['pattern'] }, };
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
@@ -5398,6 +5399,7 @@ export const operations: Operation[] = [
   // deny-all for remote callers). NOT localOnly so admin OAuth clients
   // can submit; CLI bypass via ctx.remote === false.
   run_skillopt,
+  list_slugs,
 ];
 
 export const operationsByName = Object.fromEntries(

@@ -1229,6 +1229,30 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(rowToPage);
   }
 
+  async listSlugsByRegex(
+    pattern: string,
+    opts?: { limit?: number; offset?: number; type?: string; sort_by?: "slug" | "title" | "updated_at"; sort_order?: "asc" | "desc" }
+  ): Promise<{ slug: string; title: string; type: string; updated_at: string; compiled_truth: string }[]> {
+    const limit = Math.min(opts?.limit ?? 50, 500);
+    const offset = opts?.offset ?? 0;
+    const typeFilter = opts?.type ? "AND p.type = CAST($3 AS text)" : "";
+    const sortColumn = opts?.sort_by === "updated_at" ? "p.updated_at" : opts?.sort_by === "title" ? "p.title" : "p.slug";
+    const sortDirection = opts?.sort_order === "desc" ? "DESC" : "ASC";
+    const params = opts?.type ? [pattern, limit, offset, opts.type] : [pattern, limit, offset];
+    const typeParam = opts?.type ? ", $4" : "";
+    const { rows } = await this.db.query(
+      `SELECT p.slug, p.title, p.type, p.updated_at, p.compiled_truth
+       FROM pages p
+       WHERE p.slug ~ $1
+       AND p.deleted_at IS NULL
+       ${typeFilter}
+       ORDER BY ${sortColumn} ${sortDirection}
+       LIMIT $2 OFFSET $3${typeParam}`,
+      params
+    );
+    return rows as unknown as { slug: string; title: string; type: string; updated_at: string; compiled_truth: string }[];
+  }
+
   async getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>> {
     // v0.31.8 (D12): when opts.sourceId is set, return only that source's
     // slugs (used by reconcileLinks so wikilink resolution doesn't span
