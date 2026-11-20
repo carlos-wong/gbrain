@@ -11,6 +11,7 @@
  */
 
 import { PGLiteEngine } from '../../core/pglite-engine.ts';
+import type { BrainEngine } from '../../core/engine.ts';
 
 interface PgTablesRow {
   tablename: string;
@@ -30,6 +31,10 @@ const PRESERVE_TABLES: ReadonlySet<string> = new Set([
   // Coordination locks; not content.
   'gbrain_cycle_locks',
   'subagent_rate_leases',
+  // System One eval arms insert calibrations once per brain (configureDecideBrain); empty otherwise.
+  'decide_calibrations',
+  // The brain's identity and persistence-mode singleton (#6482): a brain without exactly one row refuses every write.
+  'persistence_brain',
 ]);
 
 export async function createBenchmarkBrain(): Promise<PGLiteEngine> {
@@ -39,7 +44,7 @@ export async function createBenchmarkBrain(): Promise<PGLiteEngine> {
   return engine;
 }
 
-export async function resetTables(engine: PGLiteEngine): Promise<void> {
+export async function resetTables(engine: BrainEngine): Promise<void> {
   const rows = await engine.executeRaw<PgTablesRow>(
     `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,
   );
@@ -53,7 +58,7 @@ export async function resetTables(engine: PGLiteEngine): Promise<void> {
 }
 
 export async function withBenchmarkBrain<T>(
-  fn: (engine: PGLiteEngine) => Promise<T>,
+  fn: (engine: BrainEngine) => Promise<T>,
 ): Promise<T> {
   const engine = await createBenchmarkBrain();
   try {
@@ -61,4 +66,40 @@ export async function withBenchmarkBrain<T>(
   } finally {
     await engine.disconnect();
   }
+}
+
+/** #5092: questions per harness-owned benchmark brain before it is replaced. */
+export const LME_BRAIN_RECYCLE_EVERY = 40;
+
+/**
+ * #5092 — TRUNCATE between questions never returns PGLite's WASM memory,
+ * which grows with every question's vectors (~30 MB per 500-chunk question)
+ * until a long single-process run stalls at 100% CPU around question 90-120.
+ * `next()` hands out the brain for the next question, replacing it with a
+ * fresh, re-configured one every `every` questions (0 = never). `close()`
+ * disconnects a replacement; the first brain stays its owner's to close.
+ */
+export function brainRecycler<E extends BrainEngine>(
+  first: E,
+  every: number,
+  create: () => Promise<E>,
+  configure: (engine: E) => Promise<void>,
+): { next(): Promise<E>; close(): Promise<void> } {
+  let brain = first;
+  let served = 0;
+  return {
+    async next() {
+      if (every > 0 && served === every) {
+        await brain.disconnect();
+        brain = await create();
+        await configure(brain);
+        served = 0;
+      }
+      served++;
+      return brain;
+    },
+    async close() {
+      if (brain !== first) await brain.disconnect();
+    },
+  };
 }

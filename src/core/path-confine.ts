@@ -20,7 +20,8 @@
  */
 
 import { realpathSync, existsSync, type Stats } from 'fs';
-import { resolve as resolvePath, relative, isAbsolute, dirname, basename, join } from 'path';
+import { realpath as realpathAsync } from 'fs/promises';
+import { resolve as resolvePath, relative, isAbsolute, dirname, basename, join, sep, posix } from 'path';
 
 /**
  * Symlink-safe path confinement: realpath BOTH sides, then a separator-aware
@@ -41,9 +42,46 @@ export function isPathContained(child: string, parent: string): boolean {
   } catch {
     return false; // missing / unresolvable path → not contained
   }
-  // Append a separator so /foo doesn't match /foobar.
-  const parentWithSep = resolvedParent.endsWith('/') ? resolvedParent : resolvedParent + '/';
+  return resolvedPrefixContained(resolvedChild, resolvedParent, sep);
+}
+
+/**
+ * Pure separator-aware prefix check over ALREADY-RESOLVED paths — the exact
+ * logic that regressed on Windows (#3643/#4103: a hardcoded '/' suffix made
+ * every real backslash subdirectory fail the prefix test). Exported so the
+ * win32 shapes (drive-letter roots, backslash subtrees, UNC shares) are
+ * testable on POSIX CI, where realpathSync can never produce them
+ * (gbrain#4103 review requirement — no Windows runner exists).
+ */
+export function resolvedPrefixContained(
+  resolvedChild: string,
+  resolvedParent: string,
+  sepChar: string,
+): boolean {
+  // Append the OS separator so /foo doesn't match /foobar. `sep`, not a
+  // hardcoded '/': realpathSync returns backslash paths on Windows, so a '/'
+  // suffix would make the prefix test fail for every real subdirectory.
+  const parentWithSep = resolvedParent.endsWith(sepChar) ? resolvedParent : resolvedParent + sepChar;
   return resolvedChild === resolvedParent || resolvedChild.startsWith(parentWithSep);
+}
+
+/**
+ * True when a `path.relative(root, x)` result leaves `root`: it is exactly
+ * `..`, starts with a `..` path component (`../` or `..` + the platform
+ * separator), or is absolute (another drive on Windows). A bare
+ * `startsWith('..')` is wrong: it also matches a legal first folder such as
+ * `..drafts`, `..x` or `...`, which sits inside the root.
+ *
+ * Accepts both native and `/`-joined relative paths, because several callers
+ * normalize to `/` before checking. `pathOps` lets tests pass `path.win32` to
+ * check backslash and drive-letter shapes on POSIX CI. The empty string (the
+ * root itself) is NOT an escape; callers keep their own policy for it.
+ */
+export function relativeEscapesRoot(
+  rel: string,
+  pathOps: { sep: string; isAbsolute(p: string): boolean } = { sep, isAbsolute },
+): boolean {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith('..' + pathOps.sep) || pathOps.isAbsolute(rel);
 }
 
 /**
@@ -94,6 +132,84 @@ export function realpathOrResolve(p: string): string {
 }
 
 /**
+ * Convert a Git Bash / MSYS / Cygwin drive path to native Windows form
+ * (gbrain#2955): `/c/Users/x` and `/cygdrive/c/Users/x` → `C:\Users\x`.
+ *
+ * On Windows, a `sources add --path` run from Git Bash records an msys-style
+ * `local_path`. Every later `path.win32.resolve(cwd, '/c/Users/x')` joins it
+ * as `<cwd-drive>:\c\Users\x` — a phantom path that never exists — so
+ * write-through / sync silently target a directory nothing ever created.
+ *
+ * Pure and platform-parameterized (defaults to `process.platform`) so the
+ * win32 branch is unit-testable on POSIX CI, mirroring
+ * `resolvedPrefixContained` above. On non-win32 platforms it is identity —
+ * `/c/…` is a legitimate directory name there. Anything that doesn't match
+ * the drive shape (native paths, UNC shares, relative paths, non-drive
+ * absolutes) passes through unchanged.
+ */
+export function msysToNativePath(
+  p: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'win32' || !p) return p;
+  const m = /^\/(?:cygdrive\/)?([A-Za-z])(\/.*)?$/.exec(p);
+  if (!m) return p;
+  const drive = m[1]!.toUpperCase();
+  const rest = (m[2] ?? '').replace(/\//g, '\\');
+  return `${drive}:${rest || '\\'}`;
+}
+
+/** The platform the loaded `path` module resolves for: the stored-root verdict follows the module that resolves the root. */
+const PATH_PLATFORM: NodeJS.Platform = sep === '\\' ? 'win32' : 'linux';
+
+/**
+ * #7646: is a stored root (`sources.local_path`, `sync.repo_path`) absolute on THIS host? The one predicate sync,
+ * `config set`, write-through, `sources set-path --clear` and doctor share. On win32 only a drive path (`C:\\x`, or a
+ * Git Bash `/c/x`, healed by `msysToNativePath`) or a UNC share counts: `path.win32.isAbsolute` also accepts the
+ * root-relative `\\brain` and `/brain`, which resolve against whatever drive gbrain runs from. On POSIX it is
+ * `path.posix.isAbsolute`, so a Windows drive path another host stored is not absolute here.
+ */
+export function isHostAbsolutePath(p: string, platform: NodeJS.Platform = PATH_PLATFORM): boolean {
+  if (platform !== 'win32') return posix.isAbsolute(p);
+  return /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(msysToNativePath(p, platform));
+}
+
+/** #7646: a stored root absolute only on another operating system (a Windows drive or UNC path on POSIX, a POSIX path on win32). */
+export function isForeignAbsolutePath(p: string, platform: NodeJS.Platform = PATH_PLATFORM): boolean {
+  if (isHostAbsolutePath(p, platform)) return false;
+  return platform === 'win32' ? posix.isAbsolute(p) && !/^[\\/]{2}/.test(p) : isHostAbsolutePath(p, 'win32');
+}
+
+/**
+ * Async twin of `realpathOrResolve` — same fallback contract, but backed by
+ * `fs.promises.realpath` instead of `realpathSync`. Exists so a caller
+ * resolving N independent paths (e.g. every registered source's local_path)
+ * can `Promise.all` them and let a slow/interrupted filesystem stall on ONE
+ * path without serializing behind the others: `realpathSync` blocks the
+ * event loop for its full duration no matter how many `Promise.all`-wrapped
+ * calls surround it (#4091-class root-cause), so parallelizing the SYNC
+ * function would still take sum-of-durations, not max-of-durations. Use this
+ * version whenever more than one path is being resolved together.
+ *
+ * The lexical fallback below is the same shape as the sync version above
+ * (unflagged there only because semgrep's diff-scoped CI scan doesn't
+ * re-flag pre-existing lines): `p` is never raw untrusted input at this
+ * call site — a registered source's local_path or the CLI's own cwd — and
+ * this is the fallback for a path that already failed to realpath
+ * (ENOENT/stale registration). The security boundary is the caller's
+ * realpath-both-sides prefix/containment check afterward, not this
+ * resolve() call.
+ */
+export async function realpathOrResolveAsync(p: string): Promise<string> {
+  try {
+    return await realpathAsync(p);
+  } catch {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    return resolvePath(p);
+  }
+}
+
+/**
  * Containment check for a write TARGET that may not exist yet (a new page file).
  * `isPathContained` requires the child to already exist; this instead realpaths
  * the deepest EXISTING ancestor of `target` (catching a symlinked intermediate
@@ -117,5 +233,5 @@ export function isWriteTargetContained(target: string, root: string): boolean {
   const base = realpathOrResolve(existing);
   const finalPath = tail.length ? join(base, ...tail) : base;
   const rel = relative(resolvedRoot, finalPath);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return !relativeEscapesRoot(rel);
 }
